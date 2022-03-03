@@ -1,0 +1,9 @@
+#!/bin/sh
+
+cd /home/ubuntu/backups_example;
+
+export DUPLICATI_AWS_SECRET_ACCESS_KEY=<aws_secret_access_key>;
+export DUPLICATI_AWS_ACCESS_KEY_ID=<aws_access_key_id>;
+export DUPLICATI_PASSPHRASE=<duplicati_passphrase>;
+./backup.sh > cron_log;
+

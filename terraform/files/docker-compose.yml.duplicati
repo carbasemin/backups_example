@@ -1,0 +1,13 @@
+version: "3.2"
+services:
+  duplicati:
+    image: lscr.io/linuxserver/duplicati:amd64-2.0.6
+    container_name: duplicati
+    restart: always
+    environment:
+      - PUID=7465
+      - PGID=7465
+    volumes:
+      - ./source:/source
+      - ./restore:/restore
+

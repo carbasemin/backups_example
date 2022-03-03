@@ -1,0 +1,179 @@
+- hosts: all
+  become: true
+  vars:
+    - compose_home: /home/ubuntu/compose_files
+    - gitlab_home: /home/ubuntu/gitlab
+    - duplicati_home: /home/ubuntu/duplicati
+    - ansible_files_dir: /home/ubuntu/backups_example/terraform/files
+    - aws_access_key_id: <aws_access_key_id>
+    - aws_secret_access_key: <aws_secret_access_key>
+    - duplicati_passphrase: <duplicati_passphrase>
+    - certbot_mail: <certbot_mail>
+    - gitlab_domain: <gitlab_domain>
+    
+  tasks:
+    - name: Install aptitude. Ansible preferes aptitude to apt.
+      apt:
+        name: aptitude
+        state: latest
+        update_cache: yes
+        force_apt_get: yes
+
+    # Install Docker.
+    - name: Install dependencies.
+      apt:
+        name: "{{ item }}"
+        state: latest
+        update_cache: yes
+      loop:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - software-properties-common
+        - python3-pip
+        - virtualenv
+        - python3-setuptools
+
+    - name: Add Docker GPG.
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repo.
+      apt_repository:
+        repo: deb https://download.docker.com/linux/ubuntu focal stable
+        state: present
+
+    - name: Update cache and install Docker.
+      apt:
+        name: docker-ce
+        update_cache: yes
+        state: latest
+
+    - name: pip install Docker and docker-compose.
+      pip:
+        name: "{{ item }}"
+      loop:
+        - docker
+        - docker-compose
+
+    # Prepare the env for GitLab and Duplicati.
+    - name: Create user abc (for Duplicati).
+      user:
+        name: abc
+        uid: 7465
+
+    - name: Create a folder for compose files and GitLab.
+      file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ compose_home }}"
+        - "{{ gitlab_home }}"
+        - "{{ duplicati_home }}"
+
+    - name: Create duplicati volumes and chown abc:abc.
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: abc
+      loop:
+        - "{{ duplicati_home }}/restore"
+        - "{{ duplicati_home }}/source"
+
+    - name: Create GitLab volumes.
+      file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ gitlab_home}}/config"
+        - "{{ gitlab_home}}/logs"
+        - "{{ gitlab_home}}/data"
+
+    - name: Push compose files (both Duplicati and GitLab) to remote.
+      copy:
+        src: "{{ item }}"
+        dest: "{{ compose_home }}"
+      loop:
+        - "{{ ansible_files_dir }}/docker-compose.yml.gitlab"
+        - "{{ ansible_files_dir }}/docker-compose.yml.duplicati"
+
+    # Create Gitlab and duplicati containers.
+    - name: Create GitLab and Duplicati containers.
+      community.docker.docker_compose:
+        project_src: "{{ compose_home }}"
+        files:
+          - docker-compose.yml.gitlab
+          - docker-compose.yml.duplicati
+
+    # Pull backups from S3 and feed GitLab container with 'em.
+    - name: Pull GitLab backups from S3 using Duplicati.
+      community.docker.docker_container_exec:
+        container: duplicati
+        tty: yes
+        command: mono /app/duplicati/Duplicati.CommandLine.exe restore "s3s://backups/gitlab?auth-username={{ aws_access_key_id }}&auth-password={{ aws_secret_access_key }}" --passphrase={{ duplicati_passphrase }} --restore-path=/restore/gitlab
+      ignore_errors: yes
+
+    # cp the backup to a GitLab volume.
+    - name: Copy the GitLab backup from Duplicati volume to GitLab volume.
+      copy:
+        remote_src: yes
+        src: "{{ duplicati_home }}/restore/gitlab/"
+        dest: "{{ gitlab_home }}/data/backups"
+
+    # Feed GitLab with the backup.
+    - name: Restore GitLab.
+      community.docker.docker_container_exec:
+        container: gitlab
+        command: "{{ item }} "
+      loop:
+        -  chown -R git:git /var/opt/gitlab/backups
+        -  gitlab-ctl stop puma
+        -  gitlab-ctl stop sidekiq
+        -  gitlab-backup restore GITLAB_ASSUME_YES=1
+      ignore_errors: yes
+         
+    - name: Copy GitLab config to remote.
+      copy:
+        src: "{{ ansible_files_dir }}/config"
+        dest: "{{ gitlab_home }}"
+
+    - name: Reconfigure GitLab.
+      community.docker.docker_container_exec:
+        container: gitlab
+        command: "{{ item }} "
+      loop:
+        - gitlab-ctl reconfigure
+        - gitlab-ctl restart
+      ignore_errors: yes
+
+    # nginx stuff.
+    - name: Install Nginx.
+      apt:
+        name: nginx
+        update_cache: yes
+        state: latest
+
+    - name: Copy nginx gitlab config to remote.
+      copy:
+        src: "{{ ansible_files_dir }}/gitlab.conf"
+        dest: /etc/nginx/conf.d
+   
+    - name: Reload nginx.
+      command:
+        cmd: systemctl reload nginx
+
+    # Certs.
+    - name: Install certbot.
+      apt:
+        name: "{{ item }}"
+        update_cache: yes
+        state: latest
+      loop:
+        - certbot
+        - python3-certbot-nginx
+
+    - name: Create an nginx certificate for GitLab.
+      command:
+        cmd: certbot --non-interactive --keep -m {{ certbot_mail }} --nginx -d {{ gitlab_domain }}
+
